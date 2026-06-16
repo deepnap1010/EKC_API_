@@ -1,0 +1,23 @@
+{
+  "name": "ekc-smartfactory-api",
+  "version": "1.0.0",
+  "description": "EKC SmartFactory - dynamic telemetry ingest API for industrial machines",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "author": "ITSYBIZZ AI Private Limited",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "mongoose": "^8.5.0"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^11.2.0"
+  }
+}

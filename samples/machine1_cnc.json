@@ -1,0 +1,18 @@
+{
+  "machineId": "EKC_CNC_MACHINING_01",
+  "machineName": "CNC Machine 01",
+  "machineType": "CNC Machining",
+  "department": "Production Floor A",
+  "timestamp": "2026-06-16T04:55:00Z",
+  "data": {
+    "spindleSpeed": 1961,
+    "feedRate": 204,
+    "spindleLoad": 94,
+    "toolTemp": 44,
+    "coolantFlow": 15,
+    "threadDepth": 3,
+    "production": 0,
+    "speed": 0,
+    "efficiency": 0
+  }
+}

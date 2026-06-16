@@ -1,0 +1,18 @@
+{
+  "machineId": "EKC_HEAT_TREATMENT_01",
+  "machineName": "Heat Treatment 01",
+  "machineType": "Heat Treatment",
+  "department": "Production Floor B",
+  "timestamp": "2026-06-16T04:55:00Z",
+  "data": {
+    "hardeningTemp": 863,
+    "quenchTemp": 47,
+    "temperingTemp": 587,
+    "conveyorSpeed": 1,
+    "soakTime": 32,
+    "power": 607,
+    "production": 0,
+    "speed": 0,
+    "efficiency": 0
+  }
+}
