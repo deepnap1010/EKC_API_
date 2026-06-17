@@ -1,0 +1,11 @@
+{
+  "machineId": "EKC_CNC_MACHINING_01",
+  "machineType": "CNC Machining",
+  "timestamp": "2026-06-17T10:30:01Z",
+  "eventId": "EKC_CNC_MACHINING_01-1718620201000",
+  "data": {
+    "spindleSpeed": 1961,
+    "feedRate": 204,
+    "toolTemp": 44
+  }
+}

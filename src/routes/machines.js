@@ -36,6 +36,42 @@ router.get('/machines', async (req, res) => {
 });
 
 /**
+ * GET /api/v1/overview
+ * One-shot live snapshot for a dashboard: every machine + its latest reading +
+ * a computed online/offline flag (based on how recently it last reported).
+ * Pair this with GET /api/v1/stream — fetch /overview once to draw the grid,
+ * then let the stream keep it live.
+ */
+router.get('/overview', async (req, res) => {
+  try {
+    const offlineAfter = parseInt(process.env.MACHINE_OFFLINE_AFTER_MS, 10) || 15_000;
+    const now = Date.now();
+
+    const machines = await Machine.find({}).sort({ lastSeenAt: -1 }).lean();
+    const rows = await Promise.all(
+      machines.map(async (m) => {
+        const latest = await Telemetry.findOne({ machineId: m.machineId }).sort({ timestamp: -1 }).lean();
+        const lastSeen = m.lastSeenAt ? new Date(m.lastSeenAt).getTime() : 0;
+        return {
+          machineId: m.machineId,
+          machineName: m.machineName,
+          machineType: m.machineType,
+          department: m.department,
+          payloadCount: m.payloadCount,
+          lastSeenAt: m.lastSeenAt,
+          online: lastSeen > 0 && now - lastSeen <= offlineAfter,
+          latest: latest ? { timestamp: latest.timestamp, receivedAt: latest.receivedAt, data: latest.data } : null,
+        };
+      })
+    );
+
+    return res.json({ success: true, count: rows.length, offlineAfterMs: offlineAfter, machines: rows });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: 'Failed to build overview' });
+  }
+});
+
+/**
  * GET /api/v1/telemetry/:machineId
  * Recent readings for a machine, newest first. ?limit= (default 50, max 500).
  */
@@ -55,14 +91,15 @@ router.get('/telemetry/:machineId', async (req, res) => {
 /**
  * GET /api/v1/telemetry/:machineId/latest
  * Single most-recent reading for a machine.
+ *
+ * Returns 200 with telemetry:null when the machine hasn't reported yet — a
+ * dashboard polling this right after startup used to get an "unexpected 404".
+ * null is easy to handle ("no data yet"); the 404 is reserved for wrong URLs.
  */
 router.get('/telemetry/:machineId/latest', async (req, res) => {
   try {
-    const row = await Telemetry.findOne({ machineId: req.params.machineId })
-      .sort({ timestamp: -1 })
-      .lean();
-    if (!row) return res.status(404).json({ success: false, error: 'No telemetry for this machine' });
-    return res.json({ success: true, telemetry: row });
+    const row = await Telemetry.findOne({ machineId: req.params.machineId }).sort({ timestamp: -1 }).lean();
+    return res.json({ success: true, machineId: req.params.machineId, telemetry: row || null });
   } catch (err) {
     return res.status(500).json({ success: false, error: 'Failed to fetch latest telemetry' });
   }

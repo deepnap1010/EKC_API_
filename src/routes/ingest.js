@@ -3,6 +3,7 @@ import Machine from '../models/Machine.js';
 import Telemetry from '../models/Telemetry.js';
 import { machineAuth } from '../middleware/machineAuth.js';
 import { isDbReady } from '../config/db.js';
+import { broadcast } from '../realtime/sse.js';
 
 const router = Router();
 
@@ -16,7 +17,9 @@ const RESERVED = new Set([
   'machineId', 'machine_id', 'machineID', 'deviceId', 'device_id', 'id',
   'machineName', 'machine_name', 'name',
   'machineType', 'machine_type', 'type',
+  'department', 'dept',
   'timestamp', 'time', 'ts', 'datetime',
+  'eventId', 'event_id', 'seq', 'sequence',
   'data', 'payload',
   'receivedAt',
 ]);
@@ -32,6 +35,15 @@ const firstOf = (obj, keys) => {
 const getMachineId = (b) => firstOf(b, ['machineId', 'machine_id', 'machineID', 'deviceId', 'device_id', 'id']);
 const getMachineName = (b) => firstOf(b, ['machineName', 'machine_name', 'name']);
 const getMachineType = (b) => firstOf(b, ['machineType', 'machine_type', 'type']);
+const getDepartment = (b) => firstOf(b, ['department', 'dept']);
+
+/**
+ * Optional client-supplied id used ONLY for idempotent retransmits. If a machine
+ * resends a reading it already sent (flaky network, retry-on-timeout), we drop
+ * the duplicate instead of storing/announcing it twice. Omit it and nothing
+ * changes — every reading is stored.
+ */
+const getEventId = (b) => firstOf(b, ['eventId', 'event_id', 'seq', 'sequence']);
 
 /** Parse a device timestamp if present and valid; otherwise undefined. */
 const getTimestamp = (b) => {
@@ -61,7 +73,7 @@ const extractData = (b) => {
 
 /**
  * Normalize one raw payload → { ok, error?, machineId, machineName, machineType,
- * timestamp, receivedAt, data }.
+ * department, eventId, timestamp, receivedAt, data }.
  */
 export function normalize(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -74,40 +86,96 @@ export function normalize(body) {
 
   const receivedAt = new Date();
   const timestamp = getTimestamp(body) ?? receivedAt;
-  const data = extractData(body);
+  const eventId = getEventId(body);
 
   return {
     ok: true,
     machineId: String(machineId),
     machineName: getMachineName(body) ? String(getMachineName(body)) : String(machineId),
     machineType: getMachineType(body) ? String(getMachineType(body)) : 'UNKNOWN',
+    department: getDepartment(body) ? String(getDepartment(body)) : undefined,
+    eventId: eventId !== undefined ? String(eventId) : undefined,
     timestamp,
     receivedAt,
-    data,
+    data: extractData(body),
   };
 }
 
-/** Upsert the machine master record and append the telemetry document. */
+/**
+ * Upsert the machine master record — race-safe.
+ *
+ * Two payloads for a BRAND-NEW machine (common with 1–5s live data and retries)
+ * can hit the upsert at the same instant; both try to INSERT and one trips the
+ * unique index on machineId → MongoDB E11000 "duplicate key error". That was the
+ * intermittent "duplicate data" 500. We catch it: the record exists now, so a
+ * plain update applies our changes with nothing lost.
+ */
+async function upsertMachine(n) {
+  const set = {
+    machineName: n.machineName,
+    machineType: n.machineType,
+    status: 'running',
+    lastSeenAt: n.receivedAt,
+  };
+  if (n.department) set.department = n.department;
+
+  try {
+    await Machine.updateOne(
+      { machineId: n.machineId },
+      { $setOnInsert: { machineId: n.machineId, registeredAt: n.receivedAt }, $set: set, $inc: { payloadCount: 1 } },
+      { upsert: true }
+    );
+  } catch (err) {
+    if (err && err.code === 11000) {
+      await Machine.updateOne({ machineId: n.machineId }, { $set: set, $inc: { payloadCount: 1 } });
+    } else {
+      throw err;
+    }
+  }
+}
+
+/**
+ * Persist one reading. Returns { doc, duplicate }.
+ *  - duplicate=true means an identical (machineId, eventId) reading was already
+ *    stored, so this is an idempotent no-op (we DON'T error or re-broadcast).
+ */
 export async function persist(n) {
-  const set = { machineName: n.machineName, machineType: n.machineType, lastSeenAt: n.receivedAt };
+  await upsertMachine(n);
 
-  await Machine.updateOne(
-    { machineId: n.machineId },
-    { $setOnInsert: { machineId: n.machineId, registeredAt: n.receivedAt }, $set: set, $inc: { payloadCount: 1 } },
-    { upsert: true }
-  );
-
-  const doc = await Telemetry.create({
+  const fields = {
     machineId: n.machineId,
     machineName: n.machineName,
     machineType: n.machineType,
     timestamp: n.timestamp,
     receivedAt: n.receivedAt,
     data: n.data,
-  });
+  };
+  if (n.eventId !== undefined) fields.eventId = n.eventId;
 
-  return doc;
+  try {
+    const doc = await Telemetry.create(fields);
+    return { doc, duplicate: false };
+  } catch (err) {
+    // Retransmit of a reading we already have (only possible when eventId is sent).
+    if (err && err.code === 11000 && n.eventId !== undefined) {
+      const doc = await Telemetry.findOne({ machineId: n.machineId, eventId: n.eventId }).lean();
+      return { doc, duplicate: true };
+    }
+    throw err;
+  }
 }
+
+/** Shape pushed to live dashboards over SSE. */
+const toReading = (n, doc) => ({
+  id: doc?._id,
+  machineId: n.machineId,
+  machineName: n.machineName,
+  machineType: n.machineType,
+  timestamp: n.timestamp,
+  receivedAt: n.receivedAt,
+  eventId: n.eventId,
+  data: n.data,
+});
 
 /* ── Routes ────────────────────────────────────────────────────────────────*/
 
@@ -124,20 +192,22 @@ router.use((req, res, next) => {
 
 /**
  * POST /api/v1/ingest
- * Single telemetry payload (the common case). Accepts any shape.
+ * Single telemetry payload (the common case — call this every 1–5s). Any shape.
  */
 router.post('/ingest', machineAuth, async (req, res) => {
   try {
     const n = normalize(req.body);
     if (!n.ok) return res.status(400).json({ success: false, error: n.error });
 
-    const doc = await persist(n);
+    const { doc, duplicate } = await persist(n);
+    if (!duplicate) broadcast(toReading(n, doc)); // push to live dashboards
 
-    return res.status(201).json({
+    return res.status(duplicate ? 200 : 201).json({
       success: true,
-      id: doc._id,
+      id: doc?._id,
       machineId: n.machineId,
-      storedKeys: Object.keys(n.data), // echo what we understood — useful during integration
+      duplicate,                          // true => idempotent retransmit, nothing new stored
+      storedKeys: Object.keys(n.data),    // echo what we understood — useful during integration
     });
   } catch (err) {
     console.error('ingest error:', err);
@@ -165,6 +235,7 @@ router.post('/ingest/batch', machineAuth, async (req, res) => {
 
     const results = [];
     let accepted = 0;
+    let duplicates = 0;
 
     for (let i = 0; i < items.length; i++) {
       const n = normalize(items[i]);
@@ -173,9 +244,11 @@ router.post('/ingest/batch', machineAuth, async (req, res) => {
         continue;
       }
       try {
-        const doc = await persist(n);
+        const { doc, duplicate } = await persist(n);
         accepted++;
-        results.push({ index: i, success: true, id: doc._id, machineId: n.machineId });
+        if (duplicate) duplicates++;
+        else broadcast(toReading(n, doc));
+        results.push({ index: i, success: true, id: doc?._id, machineId: n.machineId, duplicate });
       } catch (e) {
         results.push({ index: i, success: false, error: 'persist failed' });
       }
@@ -184,6 +257,7 @@ router.post('/ingest/batch', machineAuth, async (req, res) => {
     return res.status(accepted > 0 ? 201 : 400).json({
       success: accepted > 0,
       accepted,
+      duplicates,
       rejected: items.length - accepted,
       results,
     });
